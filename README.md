@@ -26,7 +26,7 @@ This MCP server reflects exactly that: ask it what you're using *right now*, wha
 ## Quickstart
 
 ```bash
-git clone https://github.com/<you>/homewizard-mcp-server
+git clone https://github.com/mrksmts/homewizard-mcp-server
 cd homewizard-mcp-server
 npm install        # also runs the build via the "prepare" script
 ```
@@ -98,14 +98,14 @@ Once the repo is on GitHub (or published to npm), you can skip the clone entirel
   "mcpServers": {
     "homewizard": {
       "command": "npx",
-      "args": ["-y", "github:<you>/homewizard-mcp-server"],
+      "args": ["-y", "github:mrksmts/homewizard-mcp-server"],
       "env": { "HOMEWIZARD_HOST": "192.168.1.26", "HOMEWIZARD_API_VERSION": "v1" }
     }
   }
 }
 ```
 
-Replace `github:<you>/homewizard-mcp-server` with `homewizard-mcp-server` if you've published to npm. The `prepare` script in `package.json` builds the project automatically when npm installs from git.
+Replace `github:mrksmts/homewizard-mcp-server` with `homewizard-mcp-server` if you've published to npm. The `prepare` script in `package.json` builds the project automatically when npm installs from git.
 
 ## Configuration
 
