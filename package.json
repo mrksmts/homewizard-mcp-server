@@ -1,0 +1,44 @@
+{
+  "name": "homewizard-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for the HomeWizard Energy local API (P1 meter and friends). Read-only.",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "bin": {
+    "homewizard-mcp-server": "dist/src/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "start": "node dist/src/index.js",
+    "dev": "tsx watch src/index.ts",
+    "get-token": "tsx scripts/get-token.ts",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "axios": "^1.7.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "keywords": [
+    "mcp",
+    "homewizard",
+    "p1-meter",
+    "energy",
+    "smart-meter"
+  ],
+  "license": "MIT"
+}
