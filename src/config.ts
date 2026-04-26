@@ -1,4 +1,4 @@
-import type { ApiVersion, Config } from "./types.js";
+import type { Config } from "./types.js";
 
 export function loadConfig(): Config {
   const host = process.env.HOMEWIZARD_HOST?.trim();
@@ -8,13 +8,12 @@ export function loadConfig(): Config {
     );
   }
 
-  const rawVersion = (process.env.HOMEWIZARD_API_VERSION ?? "v1").trim().toLowerCase();
-  if (rawVersion !== "v1" && rawVersion !== "v2") {
+  const apiVersion = (process.env.HOMEWIZARD_API_VERSION ?? "v1").trim().toLowerCase();
+  if (apiVersion !== "v1" && apiVersion !== "v2") {
     throw new Error(
-      `HOMEWIZARD_API_VERSION must be "v1" or "v2" (got "${rawVersion}")`,
+      `HOMEWIZARD_API_VERSION must be "v1" or "v2" (got "${apiVersion}")`,
     );
   }
-  const apiVersion = rawVersion as ApiVersion;
 
   const token = process.env.HOMEWIZARD_TOKEN?.trim() || null;
   if (apiVersion === "v2" && !token) {

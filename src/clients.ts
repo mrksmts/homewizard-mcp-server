@@ -2,6 +2,7 @@ import https from "node:https";
 import axios, { type AxiosInstance, AxiosError } from "axios";
 import { REQUEST_TIMEOUT_MS } from "./constants.js";
 import type {
+  ApiVersion,
   Config,
   DeviceInfo,
   ExternalDevice,
@@ -10,7 +11,7 @@ import type {
 } from "./types.js";
 
 export interface HomeWizardClient {
-  apiVersion: "v1" | "v2";
+  apiVersion: ApiVersion;
   getDeviceInfo(): Promise<DeviceInfo>;
   getMeasurement(): Promise<Measurement>;
   getTelegram(): Promise<string>;
@@ -18,213 +19,187 @@ export interface HomeWizardClient {
 }
 
 export function createClient(config: Config): HomeWizardClient {
-  return config.apiVersion === "v1" ? new V1Client(config) : new V2Client(config);
+  if (config.apiVersion === "v1") {
+    return new ConfigurableClient({
+      apiVersion: "v1",
+      baseURL: `http://${config.host}`,
+      headers: {},
+      paths: {
+        device: "/api",
+        measurement: "/api/v1/data",
+        telegram: "/api/v1/telegram",
+        system: "/api/v1/system",
+      },
+      normalizeMeasurement: normalizeV1Measurement,
+      normalizeSystemStatus: normalizeV1SystemStatus,
+    });
+  }
+  return new ConfigurableClient({
+    apiVersion: "v2",
+    baseURL: `https://${config.host}`,
+    headers: {
+      "X-Api-Version": "2",
+      Authorization: `Bearer ${config.token}`,
+    },
+    httpsAgent: new https.Agent({ rejectUnauthorized: config.verifyTls }),
+    paths: {
+      device: "/api",
+      measurement: "/api/measurement",
+      telegram: "/api/telegram",
+      system: "/api/system",
+    },
+    normalizeMeasurement: normalizeV2Measurement,
+    normalizeSystemStatus: normalizeV2SystemStatus,
+  });
 }
 
-const EMPTY_MEASUREMENT: Measurement = {
-  protocol_version: null,
-  meter_model: null,
-  unique_id: null,
-  timestamp: null,
-  tariff: null,
-  energy_import_kwh: null,
-  energy_import_t1_kwh: null,
-  energy_import_t2_kwh: null,
-  energy_import_t3_kwh: null,
-  energy_import_t4_kwh: null,
-  energy_export_kwh: null,
-  energy_export_t1_kwh: null,
-  energy_export_t2_kwh: null,
-  energy_export_t3_kwh: null,
-  energy_export_t4_kwh: null,
-  power_w: null,
-  power_l1_w: null,
-  power_l2_w: null,
-  power_l3_w: null,
-  voltage_v: null,
-  voltage_l1_v: null,
-  voltage_l2_v: null,
-  voltage_l3_v: null,
-  current_a: null,
-  current_l1_a: null,
-  current_l2_a: null,
-  current_l3_a: null,
-  frequency_hz: null,
-  voltage_sag_l1_count: null,
-  voltage_sag_l2_count: null,
-  voltage_sag_l3_count: null,
-  voltage_swell_l1_count: null,
-  voltage_swell_l2_count: null,
-  voltage_swell_l3_count: null,
-  any_power_fail_count: null,
-  long_power_fail_count: null,
-  average_power_15m_w: null,
-  monthly_power_peak_w: null,
-  monthly_power_peak_timestamp: null,
-  external: [],
+interface ClientOptions {
+  apiVersion: ApiVersion;
+  baseURL: string;
+  headers: Record<string, string>;
+  httpsAgent?: https.Agent;
+  paths: { device: string; measurement: string; telegram: string; system: string };
+  normalizeMeasurement: (raw: Record<string, unknown>) => Measurement;
+  normalizeSystemStatus: (raw: Record<string, unknown>) => SystemStatus;
+}
+
+class ConfigurableClient implements HomeWizardClient {
+  readonly apiVersion: ApiVersion;
+  private readonly http: AxiosInstance;
+  private readonly opts: ClientOptions;
+
+  constructor(opts: ClientOptions) {
+    this.apiVersion = opts.apiVersion;
+    this.opts = opts;
+    this.http = axios.create({
+      baseURL: opts.baseURL,
+      timeout: REQUEST_TIMEOUT_MS,
+      httpsAgent: opts.httpsAgent,
+      headers: { Accept: "application/json", ...opts.headers },
+    });
+  }
+
+  async getDeviceInfo(): Promise<DeviceInfo> {
+    const data = await this.getJson(this.opts.paths.device);
+    return {
+      product_type: asString(data.product_type),
+      product_name: asString(data.product_name),
+      serial: asString(data.serial),
+      firmware_version: asString(data.firmware_version),
+      api_version: asString(data.api_version),
+    };
+  }
+
+  async getMeasurement(): Promise<Measurement> {
+    const raw = await this.getJson(this.opts.paths.measurement);
+    return this.opts.normalizeMeasurement(raw);
+  }
+
+  async getTelegram(): Promise<string> {
+    const res = await this.http.get<string>(this.opts.paths.telegram, {
+      responseType: "text",
+      transformResponse: [(v) => v],
+    });
+    return res.data;
+  }
+
+  async getSystemStatus(): Promise<SystemStatus> {
+    const raw = await this.getJson(this.opts.paths.system);
+    return this.opts.normalizeSystemStatus(raw);
+  }
+
+  private async getJson(path: string): Promise<Record<string, unknown>> {
+    const res = await this.http.get<Record<string, unknown>>(path);
+    return res.data;
+  }
+}
+
+// ---- field map -----------------------------------------------------------
+
+type Coercer = "number" | "string";
+
+interface FieldSpec {
+  coerce: Coercer;
+  /** Source key in the v1 /api/v1/data response, when it differs from the canonical name. */
+  v1Source?: string;
+}
+
+/**
+ * Canonical (v2-style) field name → coercion + v1 source-key override.
+ * Single source of truth; both normalizers iterate this.
+ */
+const FIELDS: Record<
+  Exclude<keyof Measurement, "external" | "timestamp" | "monthly_power_peak_timestamp">,
+  FieldSpec
+> = {
+  protocol_version: { coerce: "number", v1Source: "smr_version" },
+  meter_model: { coerce: "string" },
+  unique_id: { coerce: "string" },
+  tariff: { coerce: "number", v1Source: "active_tariff" },
+
+  energy_import_kwh: { coerce: "number", v1Source: "total_power_import_kwh" },
+  energy_import_t1_kwh: { coerce: "number", v1Source: "total_power_import_t1_kwh" },
+  energy_import_t2_kwh: { coerce: "number", v1Source: "total_power_import_t2_kwh" },
+  energy_import_t3_kwh: { coerce: "number", v1Source: "total_power_import_t3_kwh" },
+  energy_import_t4_kwh: { coerce: "number", v1Source: "total_power_import_t4_kwh" },
+  energy_export_kwh: { coerce: "number", v1Source: "total_power_export_kwh" },
+  energy_export_t1_kwh: { coerce: "number", v1Source: "total_power_export_t1_kwh" },
+  energy_export_t2_kwh: { coerce: "number", v1Source: "total_power_export_t2_kwh" },
+  energy_export_t3_kwh: { coerce: "number", v1Source: "total_power_export_t3_kwh" },
+  energy_export_t4_kwh: { coerce: "number", v1Source: "total_power_export_t4_kwh" },
+
+  power_w: { coerce: "number", v1Source: "active_power_w" },
+  power_l1_w: { coerce: "number", v1Source: "active_power_l1_w" },
+  power_l2_w: { coerce: "number", v1Source: "active_power_l2_w" },
+  power_l3_w: { coerce: "number", v1Source: "active_power_l3_w" },
+
+  voltage_v: { coerce: "number", v1Source: "active_voltage_v" },
+  voltage_l1_v: { coerce: "number", v1Source: "active_voltage_l1_v" },
+  voltage_l2_v: { coerce: "number", v1Source: "active_voltage_l2_v" },
+  voltage_l3_v: { coerce: "number", v1Source: "active_voltage_l3_v" },
+
+  current_a: { coerce: "number", v1Source: "active_current_a" },
+  current_l1_a: { coerce: "number", v1Source: "active_current_l1_a" },
+  current_l2_a: { coerce: "number", v1Source: "active_current_l2_a" },
+  current_l3_a: { coerce: "number", v1Source: "active_current_l3_a" },
+
+  frequency_hz: { coerce: "number", v1Source: "active_frequency_hz" },
+
+  voltage_sag_l1_count: { coerce: "number" },
+  voltage_sag_l2_count: { coerce: "number" },
+  voltage_sag_l3_count: { coerce: "number" },
+  voltage_swell_l1_count: { coerce: "number" },
+  voltage_swell_l2_count: { coerce: "number" },
+  voltage_swell_l3_count: { coerce: "number" },
+  any_power_fail_count: { coerce: "number" },
+  long_power_fail_count: { coerce: "number" },
+
+  average_power_15m_w: { coerce: "number", v1Source: "active_power_average_w" },
+  // v1 mis-spells "monthly" as "montly" in its JSON. v2 fixed this. We map both
+  // to the canonical (correctly-spelled) field — without this override, v1
+  // devices would silently drop the value.
+  monthly_power_peak_w: { coerce: "number", v1Source: "montly_power_peak_w" },
 };
 
-// ---- v1 ----------------------------------------------------------------
-
-class V1Client implements HomeWizardClient {
-  readonly apiVersion = "v1" as const;
-  private readonly http: AxiosInstance;
-
-  constructor(config: Config) {
-    this.http = axios.create({
-      baseURL: `http://${config.host}`,
-      timeout: REQUEST_TIMEOUT_MS,
-      headers: { Accept: "application/json" },
-    });
+function applyFieldMap(
+  raw: Record<string, unknown>,
+  version: ApiVersion,
+): Omit<Measurement, "external" | "timestamp" | "monthly_power_peak_timestamp"> {
+  const out = {} as Record<string, number | string | null>;
+  for (const [canonical, spec] of Object.entries(FIELDS)) {
+    const key = version === "v1" && spec.v1Source ? spec.v1Source : canonical;
+    const value = raw[key];
+    out[canonical] = spec.coerce === "number" ? asNumber(value) : asString(value);
   }
-
-  async getDeviceInfo(): Promise<DeviceInfo> {
-    const data = await this.get<Record<string, unknown>>("/api");
-    return {
-      product_type: asString(data.product_type),
-      product_name: asString(data.product_name),
-      serial: asString(data.serial),
-      firmware_version: asString(data.firmware_version),
-      api_version: asString(data.api_version),
-    };
-  }
-
-  async getMeasurement(): Promise<Measurement> {
-    const raw = await this.get<Record<string, unknown>>("/api/v1/data");
-    return normalizeV1Measurement(raw);
-  }
-
-  async getTelegram(): Promise<string> {
-    const res = await this.http.get<string>("/api/v1/telegram", {
-      responseType: "text",
-      transformResponse: [(v) => v],
-    });
-    return typeof res.data === "string" ? res.data : String(res.data);
-  }
-
-  async getSystemStatus(): Promise<SystemStatus> {
-    const data = await this.get<Record<string, unknown>>("/api/v1/system");
-    // v1 /system only exposes cloud_enabled. Fill the rest with null.
-    return {
-      wifi_ssid: null,
-      wifi_rssi_db: null,
-      uptime_s: null,
-      cloud_enabled: asBool(data.cloud_enabled),
-      status_led_brightness_pct: null,
-      api_v1_enabled: null,
-    };
-  }
-
-  private async get<T>(path: string): Promise<T> {
-    const res = await this.http.get<T>(path);
-    return res.data;
-  }
+  return out as Omit<Measurement, "external" | "timestamp" | "monthly_power_peak_timestamp">;
 }
 
-// ---- v2 ----------------------------------------------------------------
-
-class V2Client implements HomeWizardClient {
-  readonly apiVersion = "v2" as const;
-  private readonly http: AxiosInstance;
-
-  constructor(config: Config) {
-    this.http = axios.create({
-      baseURL: `https://${config.host}`,
-      timeout: REQUEST_TIMEOUT_MS,
-      httpsAgent: new https.Agent({ rejectUnauthorized: config.verifyTls }),
-      headers: {
-        Accept: "application/json",
-        "X-Api-Version": "2",
-        Authorization: `Bearer ${config.token}`,
-      },
-    });
-  }
-
-  async getDeviceInfo(): Promise<DeviceInfo> {
-    const data = await this.get<Record<string, unknown>>("/api");
-    return {
-      product_type: asString(data.product_type),
-      product_name: asString(data.product_name),
-      serial: asString(data.serial),
-      firmware_version: asString(data.firmware_version),
-      api_version: asString(data.api_version),
-    };
-  }
-
-  async getMeasurement(): Promise<Measurement> {
-    const raw = await this.get<Record<string, unknown>>("/api/measurement");
-    return normalizeV2Measurement(raw);
-  }
-
-  async getTelegram(): Promise<string> {
-    const res = await this.http.get<string>("/api/telegram", {
-      responseType: "text",
-      transformResponse: [(v) => v],
-    });
-    return typeof res.data === "string" ? res.data : String(res.data);
-  }
-
-  async getSystemStatus(): Promise<SystemStatus> {
-    const data = await this.get<Record<string, unknown>>("/api/system");
-    return {
-      wifi_ssid: asString(data.wifi_ssid),
-      wifi_rssi_db: asNumber(data.wifi_rssi_db),
-      uptime_s: asNumber(data.uptime_s),
-      cloud_enabled: asBool(data.cloud_enabled),
-      status_led_brightness_pct: asNumber(data.status_led_brightness_pct),
-      api_v1_enabled: asBool(data.api_v1_enabled),
-    };
-  }
-
-  private async get<T>(path: string): Promise<T> {
-    const res = await this.http.get<T>(path);
-    return res.data;
-  }
-}
-
-// ---- normalization -----------------------------------------------------
+// ---- normalizers --------------------------------------------------------
 
 function normalizeV2Measurement(raw: Record<string, unknown>): Measurement {
   return {
-    ...EMPTY_MEASUREMENT,
-    protocol_version: asNumber(raw.protocol_version),
-    meter_model: asString(raw.meter_model),
-    unique_id: asString(raw.unique_id),
+    ...applyFieldMap(raw, "v2"),
     timestamp: asString(raw.timestamp),
-    tariff: asNumber(raw.tariff),
-    energy_import_kwh: asNumber(raw.energy_import_kwh),
-    energy_import_t1_kwh: asNumber(raw.energy_import_t1_kwh),
-    energy_import_t2_kwh: asNumber(raw.energy_import_t2_kwh),
-    energy_import_t3_kwh: asNumber(raw.energy_import_t3_kwh),
-    energy_import_t4_kwh: asNumber(raw.energy_import_t4_kwh),
-    energy_export_kwh: asNumber(raw.energy_export_kwh),
-    energy_export_t1_kwh: asNumber(raw.energy_export_t1_kwh),
-    energy_export_t2_kwh: asNumber(raw.energy_export_t2_kwh),
-    energy_export_t3_kwh: asNumber(raw.energy_export_t3_kwh),
-    energy_export_t4_kwh: asNumber(raw.energy_export_t4_kwh),
-    power_w: asNumber(raw.power_w),
-    power_l1_w: asNumber(raw.power_l1_w),
-    power_l2_w: asNumber(raw.power_l2_w),
-    power_l3_w: asNumber(raw.power_l3_w),
-    voltage_v: asNumber(raw.voltage_v),
-    voltage_l1_v: asNumber(raw.voltage_l1_v),
-    voltage_l2_v: asNumber(raw.voltage_l2_v),
-    voltage_l3_v: asNumber(raw.voltage_l3_v),
-    current_a: asNumber(raw.current_a),
-    current_l1_a: asNumber(raw.current_l1_a),
-    current_l2_a: asNumber(raw.current_l2_a),
-    current_l3_a: asNumber(raw.current_l3_a),
-    frequency_hz: asNumber(raw.frequency_hz),
-    voltage_sag_l1_count: asNumber(raw.voltage_sag_l1_count),
-    voltage_sag_l2_count: asNumber(raw.voltage_sag_l2_count),
-    voltage_sag_l3_count: asNumber(raw.voltage_sag_l3_count),
-    voltage_swell_l1_count: asNumber(raw.voltage_swell_l1_count),
-    voltage_swell_l2_count: asNumber(raw.voltage_swell_l2_count),
-    voltage_swell_l3_count: asNumber(raw.voltage_swell_l3_count),
-    any_power_fail_count: asNumber(raw.any_power_fail_count),
-    long_power_fail_count: asNumber(raw.long_power_fail_count),
-    average_power_15m_w: asNumber(raw.average_power_15m_w),
-    monthly_power_peak_w: asNumber(raw.monthly_power_peak_w),
     monthly_power_peak_timestamp: asString(raw.monthly_power_peak_timestamp),
     external: parseExternal(raw.external),
   };
@@ -244,47 +219,10 @@ function normalizeV1Measurement(raw: Record<string, unknown>): Measurement {
   }
 
   return {
-    ...EMPTY_MEASUREMENT,
-    protocol_version: asNumber(raw.smr_version),
-    meter_model: asString(raw.meter_model),
-    unique_id: asString(raw.unique_id),
-    // v1 has no top-level measurement timestamp; use host clock at fetch time.
+    ...applyFieldMap(raw, "v1"),
+    // v1 has no top-level measurement timestamp; synthesise one so the field
+    // is never null and snapshot logs (in downstream tooling) stay consistent.
     timestamp: new Date().toISOString(),
-    tariff: asNumber(raw.active_tariff),
-    energy_import_kwh: asNumber(raw.total_power_import_kwh),
-    energy_import_t1_kwh: asNumber(raw.total_power_import_t1_kwh),
-    energy_import_t2_kwh: asNumber(raw.total_power_import_t2_kwh),
-    energy_import_t3_kwh: asNumber(raw.total_power_import_t3_kwh),
-    energy_import_t4_kwh: asNumber(raw.total_power_import_t4_kwh),
-    energy_export_kwh: asNumber(raw.total_power_export_kwh),
-    energy_export_t1_kwh: asNumber(raw.total_power_export_t1_kwh),
-    energy_export_t2_kwh: asNumber(raw.total_power_export_t2_kwh),
-    energy_export_t3_kwh: asNumber(raw.total_power_export_t3_kwh),
-    energy_export_t4_kwh: asNumber(raw.total_power_export_t4_kwh),
-    power_w: asNumber(raw.active_power_w),
-    power_l1_w: asNumber(raw.active_power_l1_w),
-    power_l2_w: asNumber(raw.active_power_l2_w),
-    power_l3_w: asNumber(raw.active_power_l3_w),
-    voltage_v: asNumber(raw.active_voltage_v),
-    voltage_l1_v: asNumber(raw.active_voltage_l1_v),
-    voltage_l2_v: asNumber(raw.active_voltage_l2_v),
-    voltage_l3_v: asNumber(raw.active_voltage_l3_v),
-    current_a: asNumber(raw.active_current_a),
-    current_l1_a: asNumber(raw.active_current_l1_a),
-    current_l2_a: asNumber(raw.active_current_l2_a),
-    current_l3_a: asNumber(raw.active_current_l3_a),
-    frequency_hz: asNumber(raw.active_frequency_hz),
-    voltage_sag_l1_count: asNumber(raw.voltage_sag_l1_count),
-    voltage_sag_l2_count: asNumber(raw.voltage_sag_l2_count),
-    voltage_sag_l3_count: asNumber(raw.voltage_sag_l3_count),
-    voltage_swell_l1_count: asNumber(raw.voltage_swell_l1_count),
-    voltage_swell_l2_count: asNumber(raw.voltage_swell_l2_count),
-    voltage_swell_l3_count: asNumber(raw.voltage_swell_l3_count),
-    any_power_fail_count: asNumber(raw.any_power_fail_count),
-    long_power_fail_count: asNumber(raw.long_power_fail_count),
-    average_power_15m_w: asNumber(raw.active_power_average_w),
-    // v1 has a typo in the field name: "montly" instead of "monthly".
-    monthly_power_peak_w: asNumber(raw.montly_power_peak_w),
     monthly_power_peak_timestamp: parseV1Timestamp(
       asNumber(raw.montly_power_peak_timestamp),
     ),
@@ -292,21 +230,51 @@ function normalizeV1Measurement(raw: Record<string, unknown>): Measurement {
   };
 }
 
+function normalizeV2SystemStatus(raw: Record<string, unknown>): SystemStatus {
+  return {
+    wifi_ssid: asString(raw.wifi_ssid),
+    wifi_rssi_db: asNumber(raw.wifi_rssi_db),
+    uptime_s: asNumber(raw.uptime_s),
+    cloud_enabled: asBool(raw.cloud_enabled),
+    status_led_brightness_pct: asNumber(raw.status_led_brightness_pct),
+    api_v1_enabled: asBool(raw.api_v1_enabled),
+  };
+}
+
+function normalizeV1SystemStatus(raw: Record<string, unknown>): SystemStatus {
+  return {
+    wifi_ssid: null,
+    wifi_rssi_db: null,
+    uptime_s: null,
+    cloud_enabled: asBool(raw.cloud_enabled),
+    status_led_brightness_pct: null,
+    api_v1_enabled: null,
+  };
+}
+
 function parseExternal(raw: unknown): ExternalDevice[] {
   if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((e): e is Record<string, unknown> => e != null && typeof e === "object")
-    .map((e) => ({
-      unique_id: asString(e.unique_id),
-      type: asString(e.type) ?? "unknown",
-      timestamp: asString(e.timestamp),
-      value: asNumber(e.value) ?? 0,
-      unit: asString(e.unit) ?? "",
-    }));
+  const out: ExternalDevice[] = [];
+  for (const e of raw) {
+    if (e == null || typeof e !== "object") continue;
+    const entry = e as Record<string, unknown>;
+    const value = asNumber(entry.value);
+    const unit = asString(entry.unit);
+    const type = asString(entry.type);
+    if (value == null || type == null || unit == null) continue;
+    out.push({
+      unique_id: asString(entry.unique_id),
+      type,
+      timestamp: asString(entry.timestamp),
+      value,
+      unit,
+    });
+  }
+  return out;
 }
 
 /**
- * Decodes the YYMMDDHHMMSS integer timestamp format used by v1 (e.g.
+ * Decode the YYMMDDHHMMSS integer timestamp format used by v1 (e.g.
  * 230101080010 → "2023-01-01T08:00:10"). Returns null for null/0/undefined.
  * The device emits naive local timestamps (no timezone), matching v2's shape.
  */
@@ -314,21 +282,13 @@ function parseV1Timestamp(n: number | null | undefined): string | null {
   if (n == null || n === 0) return null;
   const s = String(Math.trunc(n)).padStart(12, "0");
   if (s.length !== 12) return null;
-  const yy = s.slice(0, 2);
-  const mm = s.slice(2, 4);
-  const dd = s.slice(4, 6);
-  const hh = s.slice(6, 8);
-  const mi = s.slice(8, 10);
-  const ss = s.slice(10, 12);
-  return `20${yy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
+  return `20${s.slice(0, 2)}-${s.slice(2, 4)}-${s.slice(4, 6)}T${s.slice(6, 8)}:${s.slice(8, 10)}:${s.slice(10, 12)}`;
 }
 
 // ---- coercion helpers --------------------------------------------------
 
 function asString(v: unknown): string | null {
-  if (typeof v === "string") return v;
-  if (typeof v === "number" || typeof v === "boolean") return String(v);
-  return null;
+  return typeof v === "string" ? v : null;
 }
 
 function asNumber(v: unknown): number | null {
@@ -340,8 +300,7 @@ function asNumber(v: unknown): number | null {
 }
 
 function asBool(v: unknown): boolean | null {
-  if (typeof v === "boolean") return v;
-  return null;
+  return typeof v === "boolean" ? v : null;
 }
 
 // ---- error formatting --------------------------------------------------
@@ -349,8 +308,7 @@ function asBool(v: unknown): boolean | null {
 export function describeApiError(error: unknown, context: string): string {
   if (error instanceof AxiosError) {
     if (error.response) {
-      const status = error.response.status;
-      switch (status) {
+      switch (error.response.status) {
         case 401:
           return `Error: ${context} returned 401 Unauthorized. The HOMEWIZARD_TOKEN may be invalid or revoked. Run "npm run get-token" to obtain a new one.`;
         case 403:
@@ -360,7 +318,7 @@ export function describeApiError(error: unknown, context: string): string {
         case 429:
           return `Error: ${context} returned 429 Rate limit exceeded. Wait a few seconds before retrying.`;
         default:
-          return `Error: ${context} failed with HTTP ${status}.`;
+          return `Error: ${context} failed with HTTP ${error.response.status}.`;
       }
     }
     if (error.code === "ECONNABORTED") {
